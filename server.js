@@ -42,6 +42,7 @@ express.use(require("express").urlencoded({ extended: true }));
 // SQL to run once in Supabase SQL editor:
 //   create table marcus_db (id int primary key, data jsonb not null default '{}');
 //   insert into marcus_db (id, data) values (1, '{}');
+const SB_URL = (SUPABASE_URL || "").trim().replace(/\/+$/, ""); // tolerate trailing slashes/spaces
 const SB_HEADERS = {
   "Content-Type": "application/json",
   apikey: SUPABASE_SERVICE_KEY,
@@ -50,13 +51,13 @@ const SB_HEADERS = {
 const EMPTY = { topics: {}, points: {}, checkins: {} };
 
 async function loadDB() {
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/marcus_db?id=eq.1&select=data`, { headers: SB_HEADERS });
+  const r = await fetch(`${SB_URL}/rest/v1/marcus_db?id=eq.1&select=data`, { headers: SB_HEADERS });
   if (!r.ok) { console.error("Supabase load failed", r.status, await r.text()); return { ...EMPTY }; }
   const rows = await r.json();
   return { ...EMPTY, ...(rows[0]?.data || {}) };
 }
 async function saveDB(db) {
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/marcus_db?id=eq.1`, {
+  const r = await fetch(`${SB_URL}/rest/v1/marcus_db?id=eq.1`, {
     method: "PATCH",
     headers: SB_HEADERS,
     body: JSON.stringify({ data: db }),
@@ -111,16 +112,31 @@ async function postCheckin() {
   const topic = db.topics[day];
   if (!topic) { console.log(`No topic set for ${day}, skipping check-in.`); return; }
 
-  const raw = await askAI(
-    PERSONA,
-    `Generate ONE engagement check-in question for the overnight team based on tonight's topic: "${topic}".
+  // Try Gemini up to 2x; if it still fails, use a fallback question so the hour NEVER goes silent
+  let q = null;
+  for (let attempt = 1; attempt <= 2 && !q; attempt++) {
+    const raw = await askAI(
+      PERSONA,
+      `Generate ONE engagement check-in question for the overnight team based on tonight's topic: "${topic}".
 Give exactly 3 answer options (A, B, C). Staff must pick one AND explain why.
 Respond ONLY as JSON: {"question":"...","options":["...","...","..."]} — no markdown fences.`,
-    500
-  );
-  let q;
-  try { q = JSON.parse(raw.replace(/```json|```/g, "").trim()); }
-  catch { console.error("Bad question JSON:", raw); return; }
+      500
+    );
+    if (!raw) { console.error(`Question gen attempt ${attempt} failed (Gemini)`); continue; }
+    try {
+      const m = raw.match(/\{[\s\S]*\}/); // grab the JSON object even if wrapped in extra text
+      const parsed = JSON.parse((m ? m[0] : raw).replace(/```json|```/g, "").trim());
+      if (parsed.question && parsed.options?.length === 3) q = parsed;
+      else console.error(`Question gen attempt ${attempt}: bad shape`, raw.slice(0, 200));
+    } catch { console.error(`Question gen attempt ${attempt}: bad JSON`, raw.slice(0, 200)); }
+  }
+  if (!q) {
+    console.error("Using fallback question (Gemini unavailable)");
+    q = {
+      question: `Tungkol sa "${topic}" — alin dito ang pinaka-relate mo ngayong shift?`,
+      options: ["Solid ako dito, may example pa ako", "Medyo challenge pa sa akin ito", "May tanong ako tungkol dito"],
+    };
+  }
 
   const text =
     `🕐 *Hourly Check-in!* Topic: _${topic}_\n\n*${q.question}*\n` +
@@ -297,4 +313,8 @@ express.get("/", (_, res) => res.send("Marcus Ganzo is awake. 🫡")); // Render
 (async () => {
   await app.start(PORT);
   console.log(`⚡ Marcus Ganzo running on port ${PORT} (${TZ})`);
+  // Startup self-test: verify Supabase connection & show what's stored
+  const db = await loadDB();
+  const topicDays = Object.keys(db.topics).filter(k => db.topics[k]);
+  console.log(`🗄️ Supabase check: topics set for [${topicDays.join(", ") || "NONE"}], ${Object.keys(db.points).length} players on leaderboard`);
 })();

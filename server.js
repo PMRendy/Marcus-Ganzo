@@ -25,6 +25,7 @@ const {
   SUPABASE_SERVICE_KEY,
   ADMIN_PASSWORD,
   CHECKIN_CHANNEL = "C0A71RYLS9E", // #0-project-manager-corner
+  BANTER_RATE = 0.35, // fraction of replies that get a full Gemini-powered witty response
   PORT = 3000,
 } = process.env;
 
@@ -132,26 +133,56 @@ Respond ONLY as JSON: {"question":"...","options":["...","...","..."]} — no ma
 }
 
 // ---------- 2) SCORING replies in check-in threads ----------
+// Latest check-in within the last 65 minutes (so top-level replies count too)
+function latestActiveCheckin(db) {
+  const entries = Object.entries(db.checkins).sort((a, b) => Number(b[0]) - Number(a[0]));
+  if (!entries.length) return null;
+  const [ts, c] = entries[0];
+  return (Date.now() - Number(ts) * 1000 < 65 * 60 * 1000) ? { ts, ...c } : null;
+}
+
 app.message(async ({ message }) => {
   try {
-    if (!message.thread_ts || message.bot_id || message.channel !== CHECKIN_CHANNEL) return;
+    if (message.bot_id || message.subtype || message.channel !== CHECKIN_CHANNEL) return;
+    if (message.text && /^\s*<@/.test(message.text)) return; // @mentions handled elsewhere
     const db = await loadDB();
-    const checkin = db.checkins[message.thread_ts];
-    if (!checkin) return;
+    // Accept BOTH: replies in a check-in thread, OR top-level messages while a check-in is active
+    let checkinTs = message.thread_ts && db.checkins[message.thread_ts] ? message.thread_ts : null;
+    if (!checkinTs) {
+      const active = latestActiveCheckin(db);
+      if (active && !message.thread_ts) checkinTs = active.ts;
+    }
+    if (!checkinTs) return;
+    const checkin = db.checkins[checkinTs];
 
-    const already = db.points[message.user]?.history?.some(h => h.ts === message.thread_ts);
+    const already = db.points[message.user]?.history?.some(h => h.ts === checkinTs);
     if (already) return; // one score per check-in per person
 
-    const raw = await askAI(
-      PERSONA,
-      `A team member answered a check-in.\nQuestion: ${checkin.question}\nOptions: ${checkin.options.join(" | ")}\nTheir answer: "${message.text}"\n\n` +
-      `Score it 1-3: 1 = barely an answer / no reasoning; 2 = decent pick with a short reason; 3 = thoughtful, specific reasoning.\n` +
-      `Respond ONLY as JSON: {"score":N,"comment":"one short witty Taglish reaction to their answer"} — no markdown fences.`,
-      300
-    );
-    let s;
-    try { s = JSON.parse(raw.replace(/```json|```/g, "").trim()); } catch { return; }
-    const score = Math.max(1, Math.min(3, Number(s.score) || 1));
+    // QUOTA SAVER: only ~BANTER_RATE of replies get a Gemini-powered witty response.
+    // The rest get a fast heuristic score + emoji reaction (zero API cost).
+    const useAI = Math.random() < Number(BANTER_RATE);
+    let score, comment = null;
+    if (useAI) {
+      const raw = await askAI(
+        PERSONA,
+        `A team member answered a check-in.\nQuestion: ${checkin.question}\nOptions: ${checkin.options.join(" | ")}\nTheir answer: "${message.text}"\n\n` +
+        `Score it 1-3: 1 = barely an answer / no reasoning; 2 = decent pick with a short reason; 3 = thoughtful, specific reasoning.\n` +
+        `Then write a "comment": a witty Taglish reaction that ALSO engages them like a real teammate — react to their specific reasoning, ` +
+        `and often end with a short playful follow-up question or friendly challenge (banter). 1-2 sentences max.\n` +
+        `Respond ONLY as JSON: {"score":N,"comment":"..."} — no markdown fences.`,
+        400
+      );
+      try {
+        const j = JSON.parse(raw.replace(/```json|```/g, "").trim());
+        score = Math.max(1, Math.min(3, Number(j.score) || 1));
+        comment = j.comment;
+      } catch { /* fall through to heuristic */ }
+    }
+    if (!score) {
+      // Heuristic: picked an option + explained = more words, better score
+      const words = (message.text || "").trim().split(/\s+/).length;
+      score = words >= 25 ? 3 : words >= 8 ? 2 : 1;
+    }
 
     const info = await app.client.users.info({ user: message.user });
     const name = info.user?.profile?.display_name || info.user?.real_name || message.user;
@@ -159,11 +190,21 @@ app.message(async ({ message }) => {
     if (!db.points[message.user]) db.points[message.user] = { name, total: 0, history: [] };
     db.points[message.user].name = name;
     db.points[message.user].total += score;
-    db.points[message.user].history.push({ ts: message.thread_ts, score, when: new Date().toISOString() });
+    db.points[message.user].history.push({ ts: checkinTs, score, when: new Date().toISOString() });
     await saveDB(db);
 
-    const stars = "⭐".repeat(score);
-    await post(message.channel, `${stars} *+${score} points* para kay *${name}*! ${s.comment}`, message.thread_ts);
+    if (comment) {
+      const stars = "⭐".repeat(score);
+      // Reply where they answered: their thread if threaded, else the check-in's thread (keeps channel tidy)
+      await post(message.channel, `${stars} *+${score} points* para kay *${name}*! ${comment}`, message.thread_ts || checkinTs);
+    } else {
+      // Quiet acknowledgment: emoji reactions only (star + score number), no API cost
+      const num = ["one", "two", "three"][score - 1];
+      try {
+        await app.client.reactions.add({ channel: message.channel, timestamp: message.ts, name: "star" });
+        await app.client.reactions.add({ channel: message.channel, timestamp: message.ts, name: num });
+      } catch (e) { console.error("reaction failed (add reactions:write scope?)", e.data?.error || e); }
+    }
   } catch (e) { console.error("scoring error", e); }
 });
 

@@ -1,0 +1,14 @@
+{
+  "name": "marcus-ganzo",
+  "version": "1.0.0",
+  "description": "Marcus Ganzo — AI teammate for the SMB VS Slack workspace: Q&A, hourly check-ins with points, leaderboard",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@slack/bolt": "^3.19.0",
+    "node-cron": "^3.0.3"
+  }
+}

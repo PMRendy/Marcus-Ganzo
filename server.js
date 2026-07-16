@@ -65,7 +65,7 @@ async function saveDB(db) {
 
 // ---------- GEMINI (free tier) ----------
 async function askAI(system, user, maxTokens = 800) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

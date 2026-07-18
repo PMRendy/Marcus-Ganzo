@@ -7,10 +7,20 @@
  *  3. Points        — Marcus scores each check-in reply 1–3 with judgment; points accumulate
  *  4. Leaderboard   — "@Marcus Ganzo leaderboard" on demand + auto-post Friday 4:45AM PHT
  *  5. Admin page    — /admin to set Mon–Fri topics for the week (password protected)
+ *  6. BINGO points integration — secured endpoints so the BINGO app can check/spend a
+ *     player's points to buy an extra card. See MIGRATION.sql for the required Supabase setup.
+ *  7. Nightly points recap — posted to the PM GC every shift end (not just Fridays), showing
+ *     who earned what TONIGHT plus the running overall leaderboard.
  *
- * Storage: Supabase (one JSONB row). Structure:
- *  { topics: { mon:"", tue:"", ... }, points: { "U123": { name, total, history:[...] } },
- *    checkins: { "<message_ts>": { question, options, date } } }
+ * Storage:
+ *  - Weekly topics + check-in questions: Supabase, one JSONB row (marcus_db table).
+ *  - Points: dedicated `marcus_points` table (one row per Slack user), updated atomically
+ *    via Postgres functions so concurrent check-in replies can never clobber each other.
+ *    (This replaces the old single-JSONB-blob points storage, which had a real race: two
+ *    people replying close together could load-modify-save over each other and silently
+ *    drop one person's points. If you were on the old server.js and people said "I answered
+ *    but got no points," this was almost certainly why — the new table+RPC design makes
+ *    every point award a single atomic DB operation, so it can't happen anymore.)
  */
 
 const { App, ExpressReceiver } = require("@slack/bolt");
@@ -24,6 +34,7 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,
   ADMIN_PASSWORD,
+  BINGO_INTEGRATION_SECRET, // shared secret with the BINGO backend — required for /api/points/*
   CHECKIN_CHANNEL = "C0A71RYLS9E", // #0-project-manager-corner
   BANTER_RATE = 0.35, // fraction of replies that get a full Gemini-powered witty response
   PORT = 3000,
@@ -35,11 +46,15 @@ const TZ = "Asia/Manila";
 const receiver = new ExpressReceiver({ signingSecret: SLACK_SIGNING_SECRET });
 const app = new App({ token: SLACK_BOT_TOKEN, receiver });
 const express = receiver.app; // underlying express instance
-express.use(require("express").urlencoded({ extended: true }));
+const expressLib = require("express");
+express.use(expressLib.urlencoded({ extended: true }));
+// NOTE: we deliberately do NOT add a global express.json() here — Bolt's own
+// receiver needs the raw request body to verify Slack's signature. json()
+// is applied only to the specific new routes below that need it (POST /api/points/spend).
 
-// ---------- SUPABASE STORAGE ----------
-// One table, one row holding the whole app state as JSONB (simple + atomic enough for this volume).
-// SQL to run once in Supabase SQL editor:
+// ---------- SUPABASE STORAGE (weekly topics + check-in questions) ----------
+// One table, one row holding app state as JSONB (simple + atomic enough for this volume).
+// SQL to run once in Supabase SQL editor (if not already done):
 //   create table marcus_db (id int primary key, data jsonb not null default '{}');
 //   insert into marcus_db (id, data) values (1, '{}');
 const SB_URL = (SUPABASE_URL || "").trim().replace(/\/+$/, ""); // tolerate trailing slashes/spaces
@@ -48,7 +63,7 @@ const SB_HEADERS = {
   apikey: SUPABASE_SERVICE_KEY,
   Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
 };
-const EMPTY = { topics: {}, points: {}, checkins: {} };
+const EMPTY = { topics: {}, checkins: {} };
 
 async function loadDB() {
   const r = await fetch(`${SB_URL}/rest/v1/marcus_db?id=eq.1&select=data`, { headers: SB_HEADERS });
@@ -65,22 +80,77 @@ async function saveDB(db) {
   if (!r.ok) console.error("Supabase save failed", r.status, await r.text());
 }
 
+// ---------- SUPABASE STORAGE (points — dedicated table, atomic RPC calls) ----------
+async function getPointsRow(userId) {
+  const r = await fetch(`${SB_URL}/rest/v1/marcus_points?user_id=eq.${encodeURIComponent(userId)}&select=*`, { headers: SB_HEADERS });
+  if (!r.ok) { console.error("Supabase getPointsRow failed", r.status, await r.text()); return null; }
+  const rows = await r.json();
+  return rows[0] || null;
+}
+async function getLeaderboardRows() {
+  const r = await fetch(`${SB_URL}/rest/v1/marcus_points?select=*&order=total.desc&limit=15`, { headers: SB_HEADERS });
+  if (!r.ok) { console.error("Supabase getLeaderboardRows failed", r.status, await r.text()); return []; }
+  return r.json();
+}
+// All rows, unsorted/unlimited — used to build the nightly recap (needs to scan every
+// user's `history` array for tonight's entries, not just the top 15 by total).
+async function getAllPointsRows() {
+  const r = await fetch(`${SB_URL}/rest/v1/marcus_points?select=*`, { headers: SB_HEADERS });
+  if (!r.ok) { console.error("Supabase getAllPointsRows failed", r.status, await r.text()); return []; }
+  return r.json();
+}
+async function addPointAtomic(userId, name, score, ts, when) {
+  const r = await fetch(`${SB_URL}/rest/v1/rpc/marcus_add_point`, {
+    method: "POST",
+    headers: SB_HEADERS,
+    body: JSON.stringify({ p_user_id: userId, p_name: name, p_score: score, p_ts: ts, p_when: when }),
+  });
+  if (!r.ok) console.error("Supabase addPointAtomic failed", r.status, await r.text());
+}
+async function getBalance(userId) {
+  const row = await getPointsRow(userId);
+  return row?.total ?? 0;
+}
+// Returns { success, newTotal }
+async function spendPointsAtomic(userId, amount) {
+  const r = await fetch(`${SB_URL}/rest/v1/rpc/marcus_spend_points`, {
+    method: "POST",
+    headers: SB_HEADERS,
+    body: JSON.stringify({ p_user_id: userId, p_amount: amount }),
+  });
+  if (!r.ok) {
+    console.error("Supabase spendPointsAtomic failed", r.status, await r.text());
+    return { success: false, newTotal: await getBalance(userId) };
+  }
+  const rows = await r.json();
+  const row = rows[0] || { success: false, new_total: await getBalance(userId) };
+  return { success: !!row.success, newTotal: row.new_total };
+}
+
 // ---------- GEMINI (free tier) ----------
 async function askAI(system, user, maxTokens = 800) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: system }] },
-      contents: [{ role: "user", parts: [{ text: user }] }],
-      generationConfig: { maxOutputTokens: maxTokens },
-    }),
-  });
-  const j = await r.json();
-  const text = j.candidates?.[0]?.content?.parts?.map(p => p.text).join("\n");
-  if (!text) { console.error("Gemini error:", JSON.stringify(j).slice(0, 500)); return null; }
-  return text;
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: "user", parts: [{ text: user }] }],
+        generationConfig: { maxOutputTokens: maxTokens },
+      }),
+    });
+    const j = await r.json();
+    const text = j.candidates?.[0]?.content?.parts?.map(p => p.text).join("\n");
+    if (!text) { console.error("Gemini error:", JSON.stringify(j).slice(0, 500)); return null; }
+    return text;
+  } catch (e) {
+    // FIX: network hiccups on the Gemini fetch used to throw uncaught and could take
+    // down the process. Now we just return null and callers fall back to their
+    // existing heuristics/fallback text — same behavior as a "Gemini said nothing" case.
+    console.error("askAI network error:", e.message);
+    return null;
+  }
 }
 
 const PERSONA = `You are Marcus Ganzo, the AI teammate of SMB Virtual Staffing (SMB VS), a Philippines-based
@@ -99,6 +169,19 @@ function workNightDay() {
   const d = new Date(now);
   if (hourPHT < 12) d.setDate(d.getDate() - 1);
   return d.toLocaleDateString("en-US", { weekday: "short", timeZone: TZ }).toLowerCase().slice(0, 3);
+}
+// Start-of-tonight's-shift as a JS Date (9:00PM PHT on the work night's calendar day, PHT),
+// used to filter each player's `history` down to just tonight's entries for the recap.
+function shiftStartDate() {
+  const now = new Date();
+  const hourPHT = Number(now.toLocaleString("en-US", { hour: "2-digit", hour12: false, timeZone: TZ }));
+  const d = new Date(now);
+  if (hourPHT < 12) d.setDate(d.getDate() - 1); // same "which calendar day owns this shift" logic as workNightDay()
+  // Build 9:00PM PHT on that date. PHT is UTC+8, no DST.
+  const y = Number(d.toLocaleString("en-US", { year: "numeric", timeZone: TZ }));
+  const mo = Number(d.toLocaleString("en-US", { month: "2-digit", timeZone: TZ }));
+  const da = Number(d.toLocaleString("en-US", { day: "2-digit", timeZone: TZ }));
+  return new Date(Date.UTC(y, mo - 1, da, 21 - 8, 0, 0)); // 21:00 PHT = 13:00 UTC
 }
 
 async function post(channel, text, thread_ts) {
@@ -160,7 +243,11 @@ function latestActiveCheckin(db) {
 app.message(async ({ message }) => {
   try {
     if (message.bot_id || message.subtype || message.channel !== CHECKIN_CHANNEL) return;
-    if (message.text && /^\s*<@/.test(message.text)) return; // @mentions handled elsewhere
+    // FIX: previously only skipped messages where the mention was the FIRST token
+    // (/^\s*<@/). A message like "quick q for you @Marcus Ganzo" has the mention
+    // mid-string, so it slipped through and got double-processed here AND in
+    // app_mention (Q&A + a bogus check-in score). Now matches a mention anywhere.
+    if (message.text && /<@[A-Z0-9]+>/i.test(message.text)) return; // @mentions handled elsewhere (app_mention event)
     const db = await loadDB();
     // Accept BOTH: replies in a check-in thread, OR top-level messages while a check-in is active
     let checkinTs = message.thread_ts && db.checkins[message.thread_ts] ? message.thread_ts : null;
@@ -171,7 +258,8 @@ app.message(async ({ message }) => {
     if (!checkinTs) return;
     const checkin = db.checkins[checkinTs];
 
-    const already = db.points[message.user]?.history?.some(h => h.ts === checkinTs);
+    const existingPoints = await getPointsRow(message.user);
+    const already = existingPoints?.history?.some(h => h.ts === checkinTs);
     if (already) return; // one score per check-in per person
 
     // QUOTA SAVER: only ~BANTER_RATE of replies get a Gemini-powered witty response.
@@ -203,11 +291,7 @@ app.message(async ({ message }) => {
     const info = await app.client.users.info({ user: message.user });
     const name = info.user?.profile?.display_name || info.user?.real_name || message.user;
 
-    if (!db.points[message.user]) db.points[message.user] = { name, total: 0, history: [] };
-    db.points[message.user].name = name;
-    db.points[message.user].total += score;
-    db.points[message.user].history.push({ ts: checkinTs, score, when: new Date().toISOString() });
-    await saveDB(db);
+    await addPointAtomic(message.user, name, score, checkinTs, new Date().toISOString());
 
     if (comment) {
       const stars = "⭐".repeat(score);
@@ -225,12 +309,40 @@ app.message(async ({ message }) => {
 });
 
 // ---------- 3) LEADERBOARD ----------
-function leaderboardText(db) {
-  const rows = Object.values(db.points).sort((a, b) => b.total - a.total).slice(0, 15);
+// Takes rows straight from marcus_points (already sorted+limited by getLeaderboardRows).
+function leaderboardText(rows) {
   if (!rows.length) return "Wala pang points sa leaderboard — sagot na kayo sa next check-in! 😄";
   const medals = ["🥇", "🥈", "🥉"];
   return "*🏆 Marcus Ganzo Check-in Leaderboard*\n" +
     rows.map((r, i) => `${medals[i] || `${i + 1}.`} *${r.name}* — ${r.total} pts`).join("\n");
+}
+
+// ---------- 3b) NIGHTLY RECAP (posted every shift end, not just Fridays) ----------
+// Shows who earned what TONIGHT (from shiftStartDate() to now) plus the running overall total.
+async function nightlyRecapText() {
+  const rows = await getAllPointsRows();
+  const cutoff = shiftStartDate();
+  const tonight = rows
+    .map(r => {
+      const earnedTonight = (r.history || [])
+        .filter(h => new Date(h.when) >= cutoff)
+        .reduce((sum, h) => sum + (h.score || 0), 0);
+      return { name: r.name, total: r.total, earnedTonight };
+    })
+    .filter(r => r.earnedTonight > 0)
+    .sort((a, b) => b.earnedTonight - a.earnedTonight);
+
+  if (!tonight.length) {
+    return "*📋 Tonight's Recap*\nWalang sumagot sa check-ins ngayong shift — sana next time, may points kayo! 😅";
+  }
+
+  const lines = tonight.map(r => `• *${r.name}* — +${r.earnedTonight} pts tonight (${r.total} total)`).join("\n");
+  const overallTop3 = [...rows].sort((a, b) => b.total - a.total).slice(0, 3);
+  const medals = ["🥇", "🥈", "🥉"];
+  const topLine = overallTop3.length
+    ? "\n\n*Overall standings:*\n" + overallTop3.map((r, i) => `${medals[i]} ${r.name} — ${r.total} pts`).join("\n")
+    : "";
+  return `*📋 Tonight's Recap*\n${lines}${topLine}`;
 }
 
 // ---------- 4) @MENTIONS: commands + Q&A ----------
@@ -238,8 +350,10 @@ app.event("app_mention", async ({ event }) => {
   try {
     const text = (event.text || "").toLowerCase();
     if (text.includes("leaderboard")) {
-      const db = await loadDB();
-      return post(event.channel, leaderboardText(db), event.thread_ts);
+      return post(event.channel, leaderboardText(await getLeaderboardRows()), event.thread_ts);
+    }
+    if (text.includes("recap")) {
+      return post(event.channel, await nightlyRecapText(), event.thread_ts);
     }
     // general Q&A — pull recent channel context so Marcus can answer "summarize the thread" etc.
     let context = "";
@@ -274,12 +388,13 @@ Taglish, warm and witty, max 3 lines.`, 300);
   if (msg) await post(CHECKIN_CHANNEL, `🌅 ${msg}`);
 }
 
-// Opener 9:15PM; check-ins 9:30PM, 10:30 ... 11:30PM then 12:30–4:30AM; closer 4:50AM; leaderboard Fri close
+// Opener 9:15PM; check-ins 9:30PM, 10:30 ... 11:30PM then 12:30–4:30AM;
+// nightly recap 4:45AM (every shift, not just Fridays); closer 4:50AM.
 cron.schedule("15 21 * * 1-5", opener, { timezone: TZ });
 cron.schedule("30 21-23 * * 1-5", postCheckin, { timezone: TZ });
 cron.schedule("30 0-4 * * 2-6", postCheckin, { timezone: TZ });   // after midnight = next calendar day
+cron.schedule("45 4 * * 2-6", async () => post(CHECKIN_CHANNEL, await nightlyRecapText()), { timezone: TZ });
 cron.schedule("50 4 * * 2-6", closer, { timezone: TZ });
-cron.schedule("45 4 * * 6", async () => post(CHECKIN_CHANNEL, leaderboardText(await loadDB())), { timezone: TZ }); // Sat 4:45AM = Friday shift end
 
 // ---------- 6) ADMIN PAGE (weekly topics) ----------
 const DAYS = [["mon","Monday"],["tue","Tuesday"],["wed","Wednesday"],["thu","Thursday"],["fri","Friday"]];
@@ -304,10 +419,49 @@ express.post("/admin", async (req, res) => {
 });
 express.get("/admin/leaderboard", async (req, res) => {
   if (req.query.pw !== ADMIN_PASSWORD) return res.status(403).send("Nope.");
-  const db = await loadDB();
-  res.send(`<pre style="font-size:16px;margin:40px">${leaderboardText(db).replace(/\*/g, "")}</pre>`);
+  res.send(`<pre style="font-size:16px;margin:40px">${leaderboardText(await getLeaderboardRows()).replace(/\*/g, "")}</pre>`);
 });
 express.get("/", (_, res) => res.send("Marcus Ganzo is awake. 🫡")); // Render health check
+
+// ---------- 7) BINGO POINTS INTEGRATION (server-to-server only) ----------
+// The BINGO backend calls these two routes to check/spend a player's points when they
+// buy an extra card. Protected by a shared secret (BINGO_INTEGRATION_SECRET env var) —
+// never expose this secret or these routes to a browser. The BINGO backend holds the
+// secret server-side and calls these directly, not through the BINGO frontend.
+function requireBingoAuth(req, res, next) {
+  const auth = req.headers.authorization || "";
+  if (!BINGO_INTEGRATION_SECRET || auth !== `Bearer ${BINGO_INTEGRATION_SECRET}`) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+}
+
+// GET /api/points/balance?userId=<slack user id>
+express.get("/api/points/balance", requireBingoAuth, async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    const total = await getBalance(userId);
+    res.json({ userId, total });
+  } catch (e) {
+    console.error("[/api/points/balance] failed:", e);
+    res.status(500).json({ error: String(e.message) });
+  }
+});
+
+// POST /api/points/spend  { userId, amount } — atomic, fails safely if not enough points
+express.post("/api/points/spend", expressLib.json(), requireBingoAuth, async (req, res) => {
+  try {
+    const { userId, amount } = req.body || {};
+    const amt = Number(amount);
+    if (!userId || !amt || amt <= 0) return res.status(400).json({ error: "userId and a positive amount are required" });
+    const result = await spendPointsAtomic(userId, amt);
+    res.json(result); // { success, newTotal }
+  } catch (e) {
+    console.error("[/api/points/spend] failed:", e);
+    res.status(500).json({ error: String(e.message) });
+  }
+});
 
 // ---------- START ----------
 (async () => {
@@ -316,5 +470,7 @@ express.get("/", (_, res) => res.send("Marcus Ganzo is awake. 🫡")); // Render
   // Startup self-test: verify Supabase connection & show what's stored
   const db = await loadDB();
   const topicDays = Object.keys(db.topics).filter(k => db.topics[k]);
-  console.log(`🗄️ Supabase check: topics set for [${topicDays.join(", ") || "NONE"}], ${Object.keys(db.points).length} players on leaderboard`);
+  const leaderboardRows = await getLeaderboardRows();
+  console.log(`🗄️ Supabase check: topics set for [${topicDays.join(", ") || "NONE"}], ${leaderboardRows.length} players on leaderboard (top 15)`);
+  if (!BINGO_INTEGRATION_SECRET) console.warn("⚠️ BINGO_INTEGRATION_SECRET not set — /api/points/* routes will reject all requests.");
 })();

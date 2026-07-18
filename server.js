@@ -421,6 +421,20 @@ express.get("/admin/leaderboard", async (req, res) => {
   if (req.query.pw !== ADMIN_PASSWORD) return res.status(403).send("Nope.");
   res.send(`<pre style="font-size:16px;margin:40px">${leaderboardText(await getLeaderboardRows()).replace(/\*/g, "")}</pre>`);
 });
+
+// TESTING ONLY (2026-07-18): manually fire an hourly check-in right now, so you can
+// verify the whole points flow (question posts to the channel, you reply, points get
+// scored) without waiting for the real 9:30PM-4:30AM PHT schedule. Password-protected,
+// same as /admin. Visit this URL in your browser: /admin/test-checkin?pw=YOUR_PASSWORD
+express.get("/admin/test-checkin", async (req, res) => {
+  if (req.query.pw !== ADMIN_PASSWORD) return res.status(403).send("Nope.");
+  try {
+    await postCheckin();
+    res.send("Check-in posted to the channel — go reply to it there, then revisit /admin/leaderboard or @mention Marcus with 'recap' to see the points land.");
+  } catch (e) {
+    res.status(500).send("Failed: " + e.message);
+  }
+});
 express.get("/", (_, res) => res.send("Marcus Ganzo is awake. 🫡")); // Render health check
 
 // ---------- 7) BINGO POINTS INTEGRATION (server-to-server only) ----------
